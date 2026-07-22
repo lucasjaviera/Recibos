@@ -48,12 +48,26 @@ COD_RE = re.compile(r"^\d{4}$")
 CUIL_RE = re.compile(r"^\d{2}-\d{7,8}-\d$")
 
 # Tolerancia vertical (en px) para agrupar palabras en una misma "fila".
-# En el Formato A la columna "Deducciones" se renderiza ~3px más abajo que el
-# resto de la fila, por eso agrupamos con una holgura pequeña.
-Y_TOL = 5
+# Cubre dos casos: (1) columnas que se renderizan un par de px más abajo
+# (Deducciones en Formato A) y (2) conceptos que ocupan 2-3 renglones
+# (Formato C, p.ej. "Ad. Zona ... Vaca Muerta 85%"). El salto mínimo entre
+# filas de concepto reales es ~9px en los tres formatos, así que 8 agrupa los
+# renglones de un mismo concepto sin fusionar conceptos distintos.
+Y_TOL = 8
 
 # Nombres de columnas del DataFrame final (en el orden pedido).
-COLUMNS = ["Legajo", "Apellido y nombre", "Código", "Concepto", "Unidad", "Importe liquidado"]
+# "Período" (MM/AAAA) va primero para poder agrupar/filtrar por liquidación
+# cuando se suben muchos PDF de distintos meses en una sola tanda.
+COLUMNS = ["Período", "Legajo", "Apellido y nombre", "Código", "Concepto", "Unidad", "Importe liquidado"]
+
+# Meses en español -> número, para unificar el período del Formato C
+# ("Enero 2026" -> "01/2026").
+MESES = {
+    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+    "septiembre": "09", "setiembre": "09", "octubre": "10",
+    "noviembre": "11", "diciembre": "12",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +95,44 @@ def _to_float(texto):
 def _es_importe(texto):
     """True si el token parece un importe numérico (permite signo y separadores)."""
     return bool(re.fullmatch(r"-?[\d.]+,\d{2}", (texto or "").strip()))
+
+
+def _periodo(texto, formato):
+    """
+    Devuelve el período de liquidación unificado como "MM/AAAA" a partir del
+    texto de la página, según el formato detectado:
+
+      - Formato A: "Período: Mensual 01/2026"      -> "01/2026"
+      - Formato B: "Mensual 06 2026" (Q. MES AÑO)   -> "06/2026"
+      - Formato C: "Enero 2026" (PERÍODO DE PAGO)   -> "01/2026"
+
+    Si no lo encuentra con la regla del formato, intenta un patrón genérico
+    MM/AAAA. Devuelve None si no hay período reconocible.
+    """
+    t = texto or ""
+
+    if formato == "A":
+        # El período de liquidación viene tras "Período: <Mensual|Quincenal>".
+        m = re.search(r"Per[ií]odo:\s*\w+\s+(\d{1,2})/(\d{4})", t)
+        if m:
+            return f"{int(m.group(1)):02d}/{m.group(2)}"
+
+    elif formato == "B":
+        # Fila "Mensual 06 2026" bajo la cabecera Q. MES AÑO.
+        m = re.search(r"(?:Mensual|Quincenal|Semanal)\s+(\d{1,2})\s+(\d{4})", t)
+        if m:
+            return f"{int(m.group(1)):02d}/{m.group(2)}"
+
+    elif formato == "C":
+        # "PERÍODO DE PAGO: ... <NombreMes> <Año>".
+        meses = "|".join(MESES.keys())
+        m = re.search(rf"({meses})\s+(\d{{4}})", t, re.IGNORECASE)
+        if m:
+            return f"{MESES[m.group(1).lower()]}/{m.group(2)}"
+
+    # Respaldo genérico: primer MM/AAAA que aparezca.
+    m = re.search(r"\b(\d{2})/(\d{4})\b", t)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
 def _agrupar_en_filas(words):
@@ -311,6 +363,87 @@ def _extraer_formato_b(page):
 
 
 # ---------------------------------------------------------------------------
+# EXTRACCIÓN FORMATO C (Argentina Logistic Services) - recibo apaisado
+# ---------------------------------------------------------------------------
+
+def _extraer_formato_c(page):
+    """
+    Extrae las filas de conceptos de una página en Formato C.
+
+    Recibo apaisado y duplicado (como el Formato A): recortamos la mitad
+    izquierda. Las columnas de importe son "REMUN. SUJ. A RET.",
+    "REMUN. EXENTAS" y "DESCUENTOS": en cada fila solo una tiene valor, y esa
+    se unifica en "Importe liquidado". Los códigos de concepto son de 4 dígitos
+    (2010, 4010, ...) y la cantidad ("uds.") es un entero simple.
+    """
+    ancho_util = page.width * 0.49
+    left = page.crop((0, 0, ancho_util, page.height))
+    filas = _agrupar_en_filas(left.extract_words())
+
+    # --- Datos de cabecera: Apellido y nombre + Legajo --------------------
+    legajo, nombre = None, None
+    for i, fila in enumerate(filas):
+        textos = [t for _, t in fila]
+        if "APELLIDO" in textos and "LEGAJO" in textos:
+            if i + 1 < len(filas):
+                datos = filas[i + 1]  # p.ej: Iglesias, Franco Javier  CUIL  5
+                nombre_tokens = []
+                for _, t in datos:
+                    if CUIL_RE.match(t):
+                        continue
+                    if re.fullmatch(r"\d+", t):  # legajo: entero suelto a la derecha
+                        legajo = t
+                        continue
+                    nombre_tokens.append(t)
+                # El apellido ya trae su coma ("Iglesias,"): no la borramos.
+                nombre = " ".join(nombre_tokens).strip()
+            break
+
+    # --- Localizar la cabecera de la tabla de conceptos -------------------
+    header_idx = None
+    for i, fila in enumerate(filas):
+        textos = [t for _, t in fila]
+        if "CONCEPTO" in textos and ("DESCUENTOS" in textos or "uds." in textos):
+            header_idx = i
+            break
+
+    registros = []
+    if header_idx is None:
+        return registros
+
+    # --- Recorrer filas de conceptos hasta el pie del recibo --------------
+    for fila in filas[header_idx + 1:]:
+        textos = [t for _, t in fila]
+        if any(t.startswith(("LUGAR", "SON", "TOTAL", "----")) for t in textos):
+            break
+
+        code = fila[0][1]
+        if not COD_RE.match(code):
+            continue
+
+        concepto_tokens, unidad, importe = [], None, None
+        for x, t in fila[1:]:
+            if _es_importe(t) and x >= 225:
+                # Único importe de la fila (REMUN. SUJ / EXENTAS / DESCUENTOS).
+                importe = _to_float(t)
+            elif re.fullmatch(r"\d+", t) and 188 <= x <= 222:
+                unidad = float(t)  # columna "uds." (entero)
+            elif x < 188:
+                concepto_tokens.append(t)
+
+        registros.append({
+            "Legajo": legajo,
+            "Apellido y nombre": nombre,
+            "Código": code,
+            "Concepto": " ".join(concepto_tokens).strip(),
+            "Unidad": unidad,
+            "Importe liquidado": importe,
+        })
+
+    return registros
+
+
+# ---------------------------------------------------------------------------
 # DETECCIÓN DE FORMATO
 # ---------------------------------------------------------------------------
 
@@ -319,6 +452,7 @@ def _detectar_formato(texto_pagina):
     Decide el formato de una página a partir de su texto.
       -> "A" si aparecen las columnas Hab.C/Desc. / Hab.S/Desc. / Deducciones.
       -> "B" si aparece la cabecera CÓDIGO ... MONTO.
+      -> "C" si aparecen las columnas REMUN. SUJ. A RET. / PERÍODO DE PAGO.
       -> None si no se reconoce.
     """
     t = texto_pagina or ""
@@ -327,6 +461,8 @@ def _detectar_formato(texto_pagina):
         return "A"
     if "código" in tl and "monto" in tl:
         return "B"
+    if "remun. suj" in tl or "período de pago" in tl or "remun.exentas" in tl:
+        return "C"
     return None
 
 
@@ -355,11 +491,18 @@ def procesar_pdf(file_bytes, nombre_archivo):
                     registros_pag = _extraer_formato_a(page)
                 elif formato == "B":
                     registros_pag = _extraer_formato_b(page)
+                elif formato == "C":
+                    registros_pag = _extraer_formato_c(page)
                 else:
                     avisos.append(
                         f"⚠️ {nombre_archivo} (pág. {n_pag}): formato no reconocido, se omite."
                     )
                     continue
+
+                # Período de liquidación unificado (MM/AAAA) para toda la página.
+                periodo = _periodo(texto, formato)
+                for reg in registros_pag:
+                    reg["Período"] = periodo
 
                 if not registros_pag:
                     avisos.append(
@@ -388,7 +531,7 @@ def construir_dataframe(registros):
     df = pd.DataFrame(registros, columns=COLUMNS)
 
     # Tipado string y limpieza de espacios sobrantes.
-    for col in ["Legajo", "Apellido y nombre", "Código", "Concepto"]:
+    for col in ["Período", "Legajo", "Apellido y nombre", "Código", "Concepto"]:
         df[col] = (
             df[col].astype("string")
             .str.replace(r"\s+", " ", regex=True)
@@ -416,10 +559,11 @@ def dataframe_a_excel_bytes(df):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Recibos")
-        # Formato de texto en las columnas Legajo (A) y Código (C).
+        # Formato de texto en Legajo (col. B) y Código (col. D) para preservar
+        # ceros a la izquierda. Con "Período" adelante, B=Legajo y D=Código.
         ws = writer.sheets["Recibos"]
-        for fila in ws.iter_rows(min_row=2, min_col=1, max_col=3):
-            fila[0].number_format = "@"  # Legajo
+        for fila in ws.iter_rows(min_row=2, min_col=2, max_col=4):
+            fila[0].number_format = "@"  # Legajo (col. B)
             fila[2].number_format = "@"  # Código
     buffer.seek(0)
     return buffer.getvalue()
