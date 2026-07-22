@@ -39,10 +39,17 @@ import streamlit as st
 # CONSTANTES / CONFIGURACIÓN DE EXTRACCIÓN
 # ---------------------------------------------------------------------------
 
-# Un código de concepto es siempre un número de exactamente 4 dígitos (0010, 0300...).
-# Anclar las filas en este patrón descarta automáticamente TOTALES, NETO,
-# SUB TOTAL, la tabla de aportes del empleador (sin código) y demás ruido.
+# Un código de concepto en los Formatos A y B es siempre un número de
+# exactamente 4 dígitos (0010, 0300...). Anclar las filas en este patrón
+# descarta automáticamente TOTALES, NETO, SUB TOTAL, la tabla de aportes del
+# empleador (sin código) y demás ruido.
 COD_RE = re.compile(r"^\d{4}$")
+
+# El Formato C usa códigos de 4 dígitos (2010, 4010) pero también alfanuméricos
+# como "G993" (Impuesto a las Ganancias). Aceptamos 4 dígitos, o 1-2 letras
+# seguidas de 3-4 dígitos. Exigir la letra evita confundir un número suelto
+# (p.ej. una fila de totales) con un código.
+COD_C_RE = re.compile(r"^(?:\d{4}|[A-Z]{1,2}\d{3,4})$")
 
 # CUIL/CUIT para poder cortar el nombre en el Formato A (xx-xxxxxxxx-x).
 CUIL_RE = re.compile(r"^\d{2}-\d{7,8}-\d$")
@@ -118,7 +125,12 @@ def _periodo(texto, formato):
             return f"{int(m.group(1)):02d}/{m.group(2)}"
 
     elif formato == "B":
-        # Fila "Mensual 06 2026" bajo la cabecera Q. MES AÑO.
+        # Variante Argentina Logistic: "PERIODO DE PAGO ... Junio 2026".
+        meses = "|".join(MESES.keys())
+        m = re.search(rf"({meses})\s+(\d{{4}})", t, re.IGNORECASE)
+        if m:
+            return f"{MESES[m.group(1).lower()]}/{m.group(2)}"
+        # Variante MINERA: fila "Mensual 06 2026" bajo la cabecera Q. MES AÑO.
         m = re.search(r"(?:Mensual|Quincenal|Semanal)\s+(\d{1,2})\s+(\d{4})", t)
         if m:
             return f"{int(m.group(1)):02d}/{m.group(2)}"
@@ -267,14 +279,27 @@ def _extraer_formato_a(page):
 # EXTRACCIÓN FORMATO B (Junio en adelante) - recibo vertical
 # ---------------------------------------------------------------------------
 
+def _num_unidad(token):
+    """Extrae la parte numérica de una unidad ("22D" -> 22, "30,00" -> 30,
+    "7H" -> 7). Devuelve float o None."""
+    m = re.match(r"\d[\d.]*(?:,\d+)?", token or "")
+    return _to_float(m.group()) if m else None
+
+
 def _extraer_formato_b(page):
     """
-    Extrae las filas de conceptos de una página en Formato B.
+    Extrae las filas de conceptos de una página en Formato B (recibo vertical
+    "CONCEPTO UNIDAD BASE MONTO"). Cubre dos variantes:
 
-    Hay una tabla de aportes del EMPLEADOR arriba (cabecera "CONCEPTO...MONTO"
-    SIN código) y la tabla del empleado abajo (cabecera "CÓDIGO...MONTO").
-    Anclamos en la cabecera con "CÓDIGO" y tomamos el último número de cada
-    fila como "MONTO" -> Importe liquidado.
+      - MINERA COMIRNA: la cabecera de la tabla del empleado incluye "CÓDIGO".
+      - Argentina Logistic (junio): misma estructura pero SIN la palabra
+        "CÓDIGO" en la cabecera, con subtítulos REMUNERATIVO / NO REMUNERATIVO
+        / DESCUENTOS y unidades con letra ("22D", "7H").
+
+    En ambos casos hay una tabla de aportes del EMPLEADOR arriba que hay que
+    descartar. Para eso anclamos la tabla del empleado en la cabecera
+    "CONCEPTO ... MONTO" que aparece DESPUÉS de "SUELDO BRUTO". El importe es
+    la columna MONTO (el importe más a la derecha de cada fila).
     """
     filas = _agrupar_en_filas(page.extract_words())
 
@@ -282,73 +307,81 @@ def _extraer_formato_b(page):
     legajo, nombre = None, None
     for i, fila in enumerate(filas):
         textos = [t for _, t in fila]
-        if "APELLIDO" in textos and "LEGAJO" in textos:
+        if "APELLIDO" in textos and ("LEGAJO" in textos or "NOMBRE" in textos):
             if i + 1 < len(filas):
-                datos = filas[i + 1]  # p.ej: Mensual 06 2026 ANDRADE, JOSE MIGUEL 00000013 $ ...
+                datos = filas[i + 1]
                 nombre_tokens = []
                 for _, t in datos:
-                    if re.fullmatch(r"\d{6,}", t):  # legajo (6+ dígitos)
+                    if re.fullmatch(r"\d{2,}", t) and legajo is None and nombre_tokens:
+                        # Primer entero DESPUÉS del nombre = legajo.
                         legajo = t
                         break
-                    # Saltamos periodo/mes/año; el nombre suele venir en MAYÚSCULAS.
+                    # Saltamos Q / mes / año y el prefijo "Mensual/Quincenal".
                     if t in ("Mensual", "Quincenal") or re.fullmatch(r"\d{1,4}", t):
                         continue
+                    if _es_importe(t):  # rem. asignada / sueldo bruto: no es nombre
+                        continue
                     nombre_tokens.append(t)
-                nombre = " ".join(nombre_tokens).strip().rstrip(",")
-                # Reponemos la coma tradicional "APELLIDO, NOMBRE" si se perdió.
-                nombre = re.sub(r"\s{2,}", " ", nombre)
+                nombre = re.sub(r"\s{2,}", " ", " ".join(nombre_tokens)).strip().rstrip(",")
             break
 
-    # --- Localizar la cabecera de la tabla del EMPLEADO (con CÓDIGO) -------
-    x_unidad = None
+    # --- Localizar la cabecera de la tabla del EMPLEADO -------------------
+    # Puede haber DOS cabeceras "CONCEPTO ... MONTO": la de aportes patronales
+    # (arriba) y la del empleado (abajo). La del empleado es siempre la ÚLTIMA,
+    # así descartamos automáticamente la tabla patronal.
+    x_unidad = x_base = x_monto = None
     header_idx = None
     for i, fila in enumerate(filas):
         textos = [t for _, t in fila]
-        if "CÓDIGO" in textos and "MONTO" in textos:
-            header_idx = i
+        if "CONCEPTO" in textos and "MONTO" in textos:
+            header_idx = i  # nos quedamos con la última coincidencia
+            x_unidad = x_base = x_monto = None
             for x, t in fila:
                 if t == "UNIDAD":
                     x_unidad = x
-            break
+                elif t == "BASE":
+                    x_base = x
+                elif t == "MONTO":
+                    x_monto = x
 
     registros = []
     if header_idx is None:
         return registros
 
-    # --- Recorrer filas de conceptos hasta el final de la tabla -----------
+    x_unidad = x_unidad or 226
+    x_base = x_base or (x_unidad + 90)
+    x_monto = x_monto or (x_base + 120)
+
+    # --- Recorrer filas de conceptos hasta el pie de la tabla -------------
     for fila in filas[header_idx + 1:]:
         textos = [t for _, t in fila]
-        # La tabla del empleado termina en la fila de COMPOSICIÓN SALARIAL o
-        # "Son: ...". OJO: no cortar por "SUELDO", porque "SUELDO MENSUAL" es un
-        # concepto válido de la propia tabla.
-        if any(t.startswith(("COMPOSICIÓN", "Son:")) for t in textos):
+        if any(t.startswith(("COMPOSICIÓN", "Son:", "OBSERVACIONES", "FIRMA", "IMPORTE"))
+               for t in textos):
             break
 
         code = fila[0][1]
         if not COD_RE.match(code):
-            continue
+            continue  # descarta subtítulos (REMUNERATIVO...) y ruido
 
         concepto_tokens, unidad, importe = [], None, None
-        numeros = []  # (x, valor) de los tokens numéricos de la fila
-        x_borde = (x_unidad or 226) - 10
-
+        montos = []  # (x, valor) de importes numéricos de la fila
         for x, t in fila[1:]:
+            if t == "$":
+                continue
             if _es_importe(t):
-                numeros.append((x, _to_float(t)))
-            elif x < x_borde:
+                montos.append((x, _to_float(t)))
+            elif (x_unidad - 15) <= x < (x_base - 15) and re.match(r"\d", t):
+                unidad = _num_unidad(t)  # columna UNIDAD ("22D", "30,00", "1")
+            elif x < (x_unidad - 15):
                 concepto_tokens.append(t)
 
-        if numeros:
-            # MONTO = último número de la fila (columna más a la derecha).
-            importe = numeros[-1][1]
-            # UNIDAD = primer número SOLO si cae en la columna UNIDAD (~226-300).
-            x0_prim, val_prim = numeros[0]
-            if x0_prim < 300 and len(numeros) >= 2:
-                unidad = val_prim
-            elif x0_prim < 300 and len(numeros) == 1:
-                # Un único número que está en la columna UNIDAD (raro): es unidad,
-                # no monto. En la práctica el único número es siempre MONTO.
-                pass
+        if montos:
+            # MONTO = importe más a la derecha (descarta la columna BASE).
+            x_max, val_max = max(montos, key=lambda p: p[0])
+            if x_max >= x_monto - 40:
+                importe = val_max
+            else:
+                importe = val_max  # única columna presente: es el monto
 
         registros.append({
             "Legajo": legajo,
@@ -418,7 +451,7 @@ def _extraer_formato_c(page):
             break
 
         code = fila[0][1]
-        if not COD_RE.match(code):
+        if not COD_C_RE.match(code):
             continue
 
         concepto_tokens, unidad, importe = [], None, None
@@ -459,7 +492,9 @@ def _detectar_formato(texto_pagina):
     tl = t.lower()
     if "hab.c/desc" in tl or "hab.s/desc" in tl or "deducciones" in tl:
         return "A"
-    if "código" in tl and "monto" in tl:
+    # Formato B: layout vertical "CONCEPTO ... MONTO" con "SUELDO BRUTO".
+    # Cubre MINERA (cabecera con CÓDIGO) y Argentina Logistic junio (sin CÓDIGO).
+    if "monto" in tl and ("código" in tl or "sueldo bruto" in tl):
         return "B"
     if "remun. suj" in tl or "período de pago" in tl or "remun.exentas" in tl:
         return "C"
@@ -475,8 +510,11 @@ def procesar_pdf(file_bytes, nombre_archivo):
     Procesa un PDF completo (potencialmente muchas páginas/recibos) y devuelve
     una tupla (lista_de_registros, lista_de_avisos).
 
-    Cada 'aviso' es un string describiendo una página que no se pudo leer o
-    cuyo formato no se reconoció, sin cortar el resto del procesamiento.
+    Cada 'aviso' es un string describiendo un problema, sin cortar el resto del
+    procesamiento. Los avisos por página que no aportaban conceptos se suprimen
+    (los recibos multipágina tienen hojas de resumen sin tabla, y eso es
+    normal); en cambio, si el archivo entero no produce ningún dato se emite un
+    único aviso a nivel de archivo (probable formato nuevo).
     """
     registros, avisos = [], []
 
@@ -494,25 +532,29 @@ def procesar_pdf(file_bytes, nombre_archivo):
                 elif formato == "C":
                     registros_pag = _extraer_formato_c(page)
                 else:
-                    avisos.append(
-                        f"⚠️ {nombre_archivo} (pág. {n_pag}): formato no reconocido, se omite."
-                    )
+                    # Página no reconocida: puede ser una hoja de resumen /
+                    # continuación de un recibo multipágina. No molestamos con
+                    # un aviso por página; el chequeo a nivel de archivo (abajo)
+                    # avisará si NO se extrajo nada del archivo completo.
                     continue
 
                 # Período de liquidación unificado (MM/AAAA) para toda la página.
                 periodo = _periodo(texto, formato)
                 for reg in registros_pag:
                     reg["Período"] = periodo
-
-                if not registros_pag:
-                    avisos.append(
-                        f"⚠️ {nombre_archivo} (pág. {n_pag}): no se extrajeron conceptos."
-                    )
                 registros.extend(registros_pag)
 
             except Exception as e:  # noqa: BLE001 - queremos continuar siempre
                 avisos.append(f"❌ {nombre_archivo} (pág. {n_pag}): error al leer -> {e}")
                 continue
+
+    # Aviso a nivel de archivo: si no salió ningún concepto, probablemente sea
+    # un formato de recibo que la app todavía no conoce.
+    if not registros:
+        avisos.append(
+            f"⚠️ {nombre_archivo}: no se reconoció el formato o no se pudo "
+            f"extraer ningún dato. Puede ser un modelo de recibo nuevo."
+        )
 
     return registros, avisos
 
@@ -543,7 +585,8 @@ def construir_dataframe(registros):
     df["Importe liquidado"] = pd.to_numeric(df["Importe liquidado"], errors="coerce")
 
     # Descartar encabezados repetidos / filas basura sin código válido.
-    df = df[df["Código"].str.fullmatch(r"\d{4}", na=False)]
+    # Acepta 4 dígitos (Formatos A/B) y alfanuméricos tipo "G993" (Formato C).
+    df = df[df["Código"].str.fullmatch(r"(?:\d{4}|[A-Z]{1,2}\d{3,4})", na=False)]
 
     # Descartar filas sin ningún importe (nulos que pdfplumber pudo colar).
     df = df.dropna(subset=["Importe liquidado"])
